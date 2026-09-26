@@ -1,0 +1,6 @@
+pandas==3.0.3
+numpy==1.26.4
+scikit-learn==1.8.0
+scipy==1.17.0
+sparse_dot_topn==1.2.0
+tqdm==4.67.1
