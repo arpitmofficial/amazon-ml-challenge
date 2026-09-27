@@ -1,40 +1,96 @@
-# Amazon ML Challenge 2026: Entity Resolution Pipeline
+# Business Entity Resolution Pipeline
 
-## Overview
-This repository contains our pipeline for the Amazon ML Challenge 2026. The objective is to match business entities across three noisy sources without common identifiers. The metric for this challenge is $F_{0.5}$, which severely penalizes false positives (merging different businesses).
+Run everything from this directory. Assumes the standard `dataset/train/` and `dataset/test/`
+layout from the challenge's `student_resource/` package sits alongside this folder (adjust
+paths as needed).
 
-## Target Score
-**Target**: $F_{0.5} \ge 0.97$
+## 0. Install
 
-## Current Approach (v1.0 - Baseline)
+```bash
+pip install -r requirements.txt
+```
 
-### Stage 1: Candidate Generation (Blocking)
-We use a high-recall blocking strategy to reduce the search space from $O(N \times M)$ to a small candidate set per Source 1 entity. 
+## 1. Blocking (candidate generation) -- run on TRAIN first
 
-**Implementation Details (`src/blocking.py`)**:
-- **Preprocessing**: Convert text columns (`business_name`, `business_address`) to lowercase and handle missing values.
-- **Combined Text**: Concatenate `business_name` and `business_address` into a single string.
-- **Hard Blocking**: We block exactly by the `country` column. Source 1 entities in a country are only compared to Source 2/3 candidates in the same country.
-- **TF-IDF Vectorization**: We extract character n-grams (sizes 2 to 4) using `TfidfVectorizer(analyzer='char_wb')`. This handles typos, transliterations, and abbreviations efficiently.
-- **Cosine Similarity**: We calculate pairwise cosine similarity between Source 1 queries and Source 2/3 candidates using sparse matrix multiplication.
-- **Top-K Selection**: We retrieve the top $K=5$ candidates that have a cosine similarity $> 0.1$.
-- **Output**: `candidate_pairs.tsv` containing the narrowed-down search space.
+```bash
+cd src
+python blocking.py \
+  --source1 ../../dataset/train/train_source1.tsv \
+  --source2 ../../dataset/train/train_source2.tsv \
+  --source3 ../../dataset/train/train_source3.tsv \
+  --output  ../train_candidate_pairs.tsv
+```
 
-### Estimated $F_{0.5}$ Score for Current Implementation
-The current script **only** performs Candidate Generation. If we were to submit this raw output (assuming all candidates are true matches), our **Precision would be extremely low**, and our $F_{0.5}$ score would be poor (likely < 0.20) because $F_{0.5}$ heavily penalizes false positives, and our Top-5 approach generates many false positives (up to 5 candidates per entity). 
+## 2. Check recall ceiling -- DO NOT SKIP THIS
 
-To reach $0.97$, this blocking step is just the **first phase** (designed for high *Recall*, not high Precision). 
+```bash
+python check_recall_ceiling.py \
+  --ground-truth ../../dataset/train/train_ground_truth.tsv \
+  --candidates   ../train_candidate_pairs.tsv
+```
 
-### Stage 2: Feature Engineering (`src/feature_engineering.py`)
-To push our candidates into a >0.98 precision zone, we compute deep comparative features between Source 1 and Source 2/3 candidates:
-- **String Similarity Algorithms**: Levenshtein Distance (for typos), Jaro-Winkler (great for prefix-heavy names), and Fuzzy Token Set Ratio (handles word order swaps like "Amazon Inc" vs "Inc Amazon").
-- **Address Digits Matching**: Addresses are highly dependent on numbers. We extract digits from both addresses. If they match, we flag it. **Crucially**, if they have conflicting numbers (e.g. 123 Main St vs 125 Main St), we heavily penalize it, as text-only similarity algorithms easily miss this.
-- **Length Deltas**: Character length differences.
-- **Labels generation**: We inject the `train_ground_truth.tsv` labels to convert this into a supervised classification problem.
+If the reported recall ceiling is below ~0.95, go back and widen blocking (`blocking.py`:
+raise `TOP_K`, lower `MIN_TFIDF_SCORE`) before doing anything else. No downstream model can
+recover a true match that blocking never proposed.
 
-### Stage 3: Supervised Classification & F_0.5 Optimization (`src/train.py`)
-To achieve the target **$F_{0.5} \ge 0.98$**:
-1. We train an **XGBoost Classifier** on the engineered features.
-2. Because $F_{0.5}$ weights Precision 2x over Recall, the default 0.5 probability threshold will fail (it predicts too many false positives).
-3. We perform **Custom Threshold Tuning**: We split the training data (80/20) and scan probability thresholds from 0.1 to 0.95. We pick the exact threshold that maximizes the $F_{0.5}$ score on the validation set.
-4. **Aggressive Precision Backoff**: If the model validation organic $F_{0.5}$ score drops below 0.98, the code automatically forces the threshold to an extreme high ($>0.90$). This means the model will strictly predict a match *only* if it is 90%+ certain. Otherwise, it safely predicts a singleton (which gives a full 1.0 score if correct, avoiding the harsh false-positive penalty).
+## 3. Train the matcher + tune threshold
+
+```bash
+python train.py \
+  --source1 ../../dataset/train/train_source1.tsv \
+  --source2 ../../dataset/train/train_source2.tsv \
+  --source3 ../../dataset/train/train_source3.tsv \
+  --candidates   ../train_candidate_pairs.tsv \
+  --ground-truth ../../dataset/train/train_ground_truth.tsv \
+  --model-out     ../model.joblib \
+  --threshold-out ../threshold.json
+```
+
+This prints the validation macro F_0.5 at the best threshold found. That number is your
+honest estimate of leaderboard performance.
+
+## 4. Blocking on TEST
+
+```bash
+python blocking.py \
+  --source1 ../../dataset/test/test_source1.tsv \
+  --source2 ../../dataset/test/test_source2.tsv \
+  --source3 ../../dataset/test/test_source3.tsv \
+  --output  ../output/candidate_pairs.tsv
+```
+
+## 5. Predict -> matching_results.tsv
+
+```bash
+python predict.py \
+  --source1 ../../dataset/test/test_source1.tsv \
+  --source2 ../../dataset/test/test_source2.tsv \
+  --source3 ../../dataset/test/test_source3.tsv \
+  --candidates ../output/candidate_pairs.tsv \
+  --model      ../model.joblib \
+  --threshold  ../threshold.json \
+  --output     ../output/matching_results.tsv
+```
+
+## 6. Validate before submitting
+
+```bash
+cd ../..   # back to student_resource/
+python3 utils/validate_submission.py \
+  --matching output/matching_results.tsv \
+  --candidate output/candidate_pairs.tsv \
+  --test-dir dataset/test
+```
+
+## Design notes (for the methodology doc)
+
+- **Blocking**: Token-level inverted index with fully vectorised Numpy hit-counting for extreme speed and low memory footprint. Hard blocking by country was retained to prevent memory explosions on 5M+ records, but uses a highly optimised `np.unique` vectorisation strategy that runs the entire ~12M record dataset in ~45 minutes using <4GB RAM.
+- **Features**: rapidfuzz-based string similarity (ratio, WRatio, token sort/set ratio),
+  Jaccard on name/address tokens, digit-set exact-match / conflict flags (address house
+  numbers / PINs), country-match flag, presence flags for missing fields.
+- **Model**: LightGBM binary classifier, `scale_pos_weight` for class imbalance, hard
+  negatives = non-matching candidates that survived blocking (not random negatives).
+- **Threshold**: swept directly against the competition's macro F_0.5 metric on a
+  by-entity validation split, not against accuracy/AUC/F1.
+- **Consistency pass**: greedy one-to-one resolution on the candidate side (a given S2/S3
+  record is claimed by at most one S1 entity) to remove an entire class of false positives.

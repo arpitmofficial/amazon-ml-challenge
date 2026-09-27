@@ -1,100 +1,168 @@
-import pandas as pd
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+"""
+Stage 1: Candidate generation (blocking).
+
+Strategy (high recall, then capped for precision-friendly downstream sizing):
+  1. TF-IDF char n-gram (2-4) cosine similarity, top-K nearest neighbors per S1 entity,
+     computed via chunked sparse matrix multiplication (fast, no external ANN library needed
+     at this dataset scale; swap in FAISS if the dataset is very large).
+  2. Token-overlap inverted index blocking (catches heavy word-reordering / partial name matches
+     that char n-grams sometimes under-rank).
+  3. Union of (1) and (2), deduped, capped at MAX_CANDIDATES per S1 entity, ranked by TF-IDF score
+     (token-only hits get a lower synthetic score so they don't crowd out strong matches).
+
+Country is used as a SOFT feature later, not a hard filter here -- cross-source country label
+noise would otherwise silently cap recall.
+
+Run standalone to generate candidate_pairs.tsv for train (to measure recall ceiling) or test.
+"""
+
 import argparse
-import os
+import numpy as np
+import pandas as pd
+from collections import defaultdict
+from scipy import sparse
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-def load_data(data_dir):
-    print("Loading datasets...")
-    df_s1 = pd.read_csv(os.path.join(data_dir, "train_source1.tsv"), sep="\t")
-    df_s2 = pd.read_csv(os.path.join(data_dir, "train_source2.tsv"), sep="\t")
-    df_s3 = pd.read_csv(os.path.join(data_dir, "train_source3.tsv"), sep="\t")
-    return df_s1, df_s2, df_s3
+from utils import (
+    read_source_file,
+    normalize_name,
+    normalize_address,
+    name_tokens,
+    write_id_list_tsv,
+)
 
-def preprocess_text(df, columns):
-    """Fills NaN and lowercases text columns for TF-IDF"""
-    for col in columns:
-        df[col] = df[col].fillna("").astype(str).str.lower()
-    # Combine name and address into a single feature for blocking
-    df['combined_text'] = df['business_name'] + " " + df['business_address']
-    return df
+TOP_K = 20                 # neighbors to pull from TF-IDF search
+MAX_CANDIDATES = 30        # final cap per S1 entity after union
+MIN_TFIDF_SCORE = 0.03     # floor to strip pure-noise matches
+CHUNK_SIZE = 2000          # rows of S1 processed per matmul chunk (memory control)
 
-def generate_candidates(df_source1, df_source2_or_3, k_candidates=5):
-    """
-    Blocks by country to reduce search space, then calculates TF-IDF cosine similarity.
-    Returns a dataframe of candidate pairs.
-    """
-    candidates = []
-    
-    countries = df_source1['country'].unique()
-    
-    for country in countries:
-        print(f"Processing country: {country}")
-        s1_subset = df_source1[df_source1['country'] == country].reset_index(drop=True)
-        s23_subset = df_source2_or_3[df_source2_or_3['country'] == country].reset_index(drop=True)
-        
-        if len(s1_subset) == 0 or len(s23_subset) == 0:
+
+def build_combined_text(df: pd.DataFrame) -> pd.Series:
+    name = df["business_name"].map(normalize_name)
+    addr = df["business_address"].map(normalize_address)
+    return name + " " + addr
+
+
+def tfidf_topk_candidates(s1_df, s2_df, s3_df, vectorizer):
+    """Return dict: s1_entity_id -> list[(candidate_id, score)] via TF-IDF cosine top-K."""
+    other_df = pd.concat([s2_df, s3_df], ignore_index=True)
+    other_text = build_combined_text(other_df)
+    s1_text = build_combined_text(s1_df)
+
+    other_matrix = vectorizer.transform(other_text)          # (M, V)
+    other_matrix_norm = sparse.csr_matrix(other_matrix)
+    # normalize rows for cosine via dot product (TfidfVectorizer already L2-normalizes by default)
+    s1_matrix = vectorizer.transform(s1_text)                # (N, V)
+
+    other_ids = other_df["entity_id"].values
+    results = defaultdict(list)
+
+    n_rows = s1_matrix.shape[0]
+    for start in range(0, n_rows, CHUNK_SIZE):
+        end = min(start + CHUNK_SIZE, n_rows)
+        chunk = s1_matrix[start:end]                          # (c, V)
+        sims = chunk.dot(other_matrix_norm.T).toarray()        # (c, M) dense chunk -- bounded by CHUNK_SIZE
+        for i in range(sims.shape[0]):
+            row_scores = sims[i]
+            if not np.any(row_scores > MIN_TFIDF_SCORE):
+                continue
+            top_idx = np.argpartition(-row_scores, min(TOP_K, len(row_scores) - 1))[:TOP_K]
+            top_idx = top_idx[np.argsort(-row_scores[top_idx])]
+            s1_id = s1_df.iloc[start + i]["entity_id"]
+            for idx in top_idx:
+                score = row_scores[idx]
+                if score <= MIN_TFIDF_SCORE:
+                    continue
+                results[s1_id].append((other_ids[idx], float(score)))
+    return results
+
+
+def token_overlap_candidates(s1_df, s2_df, s3_df):
+    """Return dict: s1_entity_id -> list[(candidate_id, synthetic_score)] via inverted index."""
+    other_df = pd.concat([s2_df, s3_df], ignore_index=True)
+    other_norm_names = other_df["business_name"].map(normalize_name)
+    other_tokens = other_norm_names.map(name_tokens)
+    other_ids = other_df["entity_id"].values
+
+    inverted = defaultdict(list)
+    for idx, toks in enumerate(other_tokens):
+        for tok in toks:
+            if len(tok) < 3:   # skip very short/common tokens
+                continue
+            inverted[tok].append(idx)
+
+    s1_norm_names = s1_df["business_name"].map(normalize_name)
+    s1_tokens = s1_norm_names.map(name_tokens)
+
+    results = defaultdict(list)
+    for s1_idx, toks in enumerate(s1_tokens):
+        s1_id = s1_df.iloc[s1_idx]["entity_id"]
+        counts = defaultdict(int)
+        for tok in toks:
+            if len(tok) < 3:
+                continue
+            for other_idx in inverted.get(tok, []):
+                counts[other_idx] += 1
+        if not counts:
             continue
-            
-        # Fit TF-IDF on both combined
-        vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(2, 4), min_df=2)
-        
-        # Fit on candidate database
-        tfidf_s23 = vectorizer.fit_transform(s23_subset['combined_text'])
-        # Transform queries
-        tfidf_s1 = vectorizer.transform(s1_subset['combined_text'])
-        
-        print(f"  Calculating similarity for {len(s1_subset)} S1 entities against {len(s23_subset)} candidates...")
-        # Calculate cosine similarity (sparse matrix multiplication)
-        # Note: For very large datasets, we might need chunking here to avoid OOM
-        similarities = cosine_similarity(tfidf_s1, tfidf_s23)
-        
-        # Get top K indices for each S1 entity
-        for i in range(len(s1_subset)):
-            s1_id = s1_subset.loc[i, 'entity_id']
-            # Get indices of top k scores
-            top_k_idx = similarities[i].argsort()[-k_candidates:][::-1]
-            
-            cand_list = []
-            for idx in top_k_idx:
-                score = similarities[i, idx]
-                if score > 0.1: # Minimum similarity threshold to be a candidate
-                    cand_list.append(s23_subset.loc[idx, 'entity_id'])
-            
-            if cand_list:
-                candidates.append({
-                    'source1_entity_id': s1_id,
-                    'candidate_entity_ids': ",".join(cand_list)
-                })
-                
-    return pd.DataFrame(candidates)
+        # synthetic score in [0, ~0.3] range so it ranks below strong TF-IDF hits by default
+        max_possible = max(len(toks), 1)
+        for other_idx, cnt in counts.items():
+            synthetic_score = 0.3 * (cnt / max_possible)
+            results[s1_id].append((other_ids[other_idx], synthetic_score))
+    return results
+
+
+def merge_candidates(tfidf_map, token_map, max_candidates=MAX_CANDIDATES):
+    merged = {}
+    all_ids = set(tfidf_map.keys()) | set(token_map.keys())
+    for s1_id in all_ids:
+        best = {}
+        for cand_id, score in tfidf_map.get(s1_id, []):
+            best[cand_id] = max(best.get(cand_id, 0.0), score)
+        for cand_id, score in token_map.get(s1_id, []):
+            best[cand_id] = max(best.get(cand_id, 0.0), score)
+        ranked = sorted(best.items(), key=lambda x: -x[1])[:max_candidates]
+        merged[s1_id] = [cand_id for cand_id, _ in ranked]
+    return merged
+
+
+def run_blocking(source1_path, source2_path, source3_path, output_path):
+    s1_df = read_source_file(source1_path)
+    s2_df = read_source_file(source2_path)
+    s3_df = read_source_file(source3_path)
+
+    all_text = pd.concat([
+        build_combined_text(s1_df),
+        build_combined_text(s2_df),
+        build_combined_text(s3_df),
+    ], ignore_index=True)
+
+    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=1)
+    vectorizer.fit(all_text)
+
+    print("Running TF-IDF nearest-neighbor blocking...")
+    tfidf_map = tfidf_topk_candidates(s1_df, s2_df, s3_df, vectorizer)
+
+    print("Running token-overlap blocking...")
+    token_map = token_overlap_candidates(s1_df, s2_df, s3_df)
+
+    print("Merging candidate sets...")
+    merged = merge_candidates(tfidf_map, token_map)
+
+    # Ensure every S1 entity has a row, even with zero candidates found
+    for s1_id in s1_df["entity_id"]:
+        merged.setdefault(s1_id, [])
+
+    write_id_list_tsv(merged, output_path, "source1_entity_id", "candidate_entity_ids")
+    print(f"Wrote {output_path} ({len(merged)} S1 entities)")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, required=True, help="Path to the dataset directory")
-    parser.add_argument("--output_file", type=str, default="candidate_pairs.tsv")
+    parser.add_argument("--source1", required=True)
+    parser.add_argument("--source2", required=True)
+    parser.add_argument("--source3", required=True)
+    parser.add_argument("--output", required=True)
     args = parser.parse_args()
-    
-    df_s1, df_s2, df_s3 = load_data(args.data_dir)
-    
-    df_s1 = preprocess_text(df_s1, ['business_name', 'business_address'])
-    df_s2 = preprocess_text(df_s2, ['business_name', 'business_address'])
-    df_s3 = preprocess_text(df_s3, ['business_name', 'business_address'])
-    
-    print("Generating candidates from Source 2...")
-    cands_s2 = generate_candidates(df_s1, df_s2, k_candidates=5)
-    
-    print("Generating candidates from Source 3...")
-    cands_s3 = generate_candidates(df_s1, df_s3, k_candidates=5)
-    
-    # Combine S2 and S3 candidates
-    all_cands = pd.concat([cands_s2, cands_s3])
-    
-    # Group by source1_entity_id and merge the comma-separated strings
-    final_cands = all_cands.groupby('source1_entity_id')['candidate_entity_ids'].apply(
-        lambda x: ','.join(filter(None, x))
-    ).reset_index()
-    
-    final_cands.to_csv(args.output_file, sep='\t', index=False)
-    print(f"Candidate pairs saved to {args.output_file}")
+    run_blocking(args.source1, args.source2, args.source3, args.output)
