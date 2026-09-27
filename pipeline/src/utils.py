@@ -7,6 +7,7 @@ Shared utilities for the entity resolution pipeline:
 
 import re
 import pandas as pd
+import jellyfish
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +93,93 @@ def name_tokens(normalized_name: str) -> frozenset:
     if not normalized_name:
         return frozenset()
     return frozenset(normalized_name.split())
+
+
+# ---------------------------------------------------------------------------
+# Vectorized normalization + blocking-key generation (used by blocking_v4)
+# ---------------------------------------------------------------------------
+
+# Legal suffix expansions for Series-level normalization.
+# Direction is the OPPOSITE of _SUFFIX_MAP above (which collapses to short form):
+# here we expand abbreviations → full words so char n-gram similarity is maximised
+# across sources that write "corp" vs "corporation", etc.
+_EXPAND_SUFFIX = {
+    r'\bcorp\b': 'corporation',
+    r'\bpvt\b': 'private',
+    r'\bltd\b': 'limited',
+    r'\binc\b': 'incorporated',
+    r'\bco\b': 'company',
+    r'\brd\b': 'road',
+    r'\bst\b': 'street',
+}
+
+
+def normalize_text_series(series: pd.Series) -> pd.Series:
+    """
+    Vectorized, O(N) text normalization over a pandas Series.
+
+    Steps (identical to the scalar normalize_name but operating on the whole
+    column in one pass — no Python-level row loop):
+      1. Fill NaN → ""
+      2. Lowercase
+      3. Strip punctuation (replace non-word, non-space chars with space)
+      4. Collapse multiple whitespace runs → single space, strip edges
+      5. Expand common legal-suffix abbreviations
+
+    Used identically for business_name across S1, S2, S3, train and test —
+    import this function; do not copy-paste it.
+    """
+    s = series.fillna("").str.lower()
+    s = s.str.replace(r'[^\w\s]', ' ', regex=True)
+    s = s.str.replace(r'\s+', ' ', regex=True).str.strip()
+    for pat, rep in _EXPAND_SUFFIX.items():
+        s = s.str.replace(pat, rep, regex=True)
+    return s
+
+
+def add_blocking_keys(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Stamp four hash-join blocking key columns onto *df* (in-place copy).
+
+    Columns added:
+      norm_name        — normalized business_name (from normalize_text_series)
+      norm_address     — normalized business_address (from normalize_text_series)
+      digit_signature  — all digit runs from business_address joined into one string
+                         (house numbers, PINs, ZIPs).  Empty string when no digits.
+      phonetic_code    — Metaphone code of the first token of norm_name.
+                         Empty string for empty/non-alpha first tokens.
+      name_prefix_key  — First 4 characters of norm_name (after normalization).
+      first_letter     — First character of norm_name.
+
+    Call this once per source file.  The result is deterministic across sources
+    and across train/test; no comparisons happen here.
+    """
+    df = df.copy()
+
+    df['norm_name'] = normalize_text_series(df['business_name'])
+    df['norm_address'] = normalize_text_series(
+        df['business_address'] if 'business_address' in df.columns
+        else pd.Series([''] * len(df), dtype=str)
+    )
+
+    # digit_signature: join all digit runs from the raw address field
+    df['digit_signature'] = (
+        df['business_address']
+        .fillna('')
+        .str.findall(r'\d+')
+        .str.join('')
+    )
+
+    # phonetic_code via Metaphone on the first token — O(N) over short strings
+    first_tokens = df['norm_name'].str.split().str[0].fillna('')
+    df['phonetic_code'] = first_tokens.apply(
+        lambda t: jellyfish.metaphone(t) if t and t.isalpha() else ''
+    )
+
+    df['name_prefix_key'] = df['norm_name'].str[:4]
+    df['first_letter'] = df['norm_name'].str[:1]
+
+    return df
 
 
 # ---------------------------------------------------------------------------
