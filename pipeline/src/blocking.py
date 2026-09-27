@@ -34,7 +34,8 @@ from utils import (
 TOP_K = 20                 # neighbors to pull from TF-IDF search
 MAX_CANDIDATES = 30        # final cap per S1 entity after union
 MIN_TFIDF_SCORE = 0.03     # floor to strip pure-noise matches
-CHUNK_SIZE = 2000          # rows of S1 processed per matmul chunk (memory control)
+CHUNK_SIZE = 500           # rows of S1 processed per matmul chunk (memory control)
+MAX_VOCAB = 100_000        # cap TF-IDF vocabulary size to bound memory on low-RAM machines
 
 
 def build_combined_text(df: pd.DataFrame) -> pd.Series:
@@ -44,15 +45,23 @@ def build_combined_text(df: pd.DataFrame) -> pd.Series:
 
 
 def tfidf_topk_candidates(s1_df, s2_df, s3_df, vectorizer):
-    """Return dict: s1_entity_id -> list[(candidate_id, score)] via TF-IDF cosine top-K."""
+    """
+    Return dict: s1_entity_id -> list[(candidate_id, score)] via TF-IDF cosine top-K.
+
+    MEMORY-SAFE VERSION: the similarity matrix is kept SPARSE the entire time.
+    Never call .toarray() on a chunk -- for large datasets that densifies a
+    (chunk_size x total_other_records) matrix, which can be many GB even for a
+    modest chunk size. TF-IDF vectors barely overlap for most pairs, so the
+    sparse product is tiny by comparison; we extract top-k straight from each
+    sparse row's own nonzero entries.
+    """
     other_df = pd.concat([s2_df, s3_df], ignore_index=True)
     other_text = build_combined_text(other_df)
     s1_text = build_combined_text(s1_df)
 
-    other_matrix = vectorizer.transform(other_text)          # (M, V)
-    other_matrix_norm = sparse.csr_matrix(other_matrix)
-    # normalize rows for cosine via dot product (TfidfVectorizer already L2-normalizes by default)
-    s1_matrix = vectorizer.transform(s1_text)                # (N, V)
+    other_matrix = vectorizer.transform(other_text).tocsr()   # (M, V), already L2-normalized
+    s1_matrix = vectorizer.transform(s1_text).tocsr()         # (N, V)
+    other_matrix_T = other_matrix.T.tocsr()                   # (V, M), built once
 
     other_ids = other_df["entity_id"].values
     results = defaultdict(list)
@@ -60,20 +69,26 @@ def tfidf_topk_candidates(s1_df, s2_df, s3_df, vectorizer):
     n_rows = s1_matrix.shape[0]
     for start in range(0, n_rows, CHUNK_SIZE):
         end = min(start + CHUNK_SIZE, n_rows)
-        chunk = s1_matrix[start:end]                          # (c, V)
-        sims = chunk.dot(other_matrix_norm.T).toarray()        # (c, M) dense chunk -- bounded by CHUNK_SIZE
+        chunk = s1_matrix[start:end]                          # (c, V) sparse
+        sims = chunk.dot(other_matrix_T).tocsr()               # (c, M) SPARSE -- no .toarray()
         for i in range(sims.shape[0]):
-            row_scores = sims[i]
-            if not np.any(row_scores > MIN_TFIDF_SCORE):
+            row = sims.getrow(i)
+            if row.nnz == 0:
                 continue
-            top_idx = np.argpartition(-row_scores, min(TOP_K, len(row_scores) - 1))[:TOP_K]
-            top_idx = top_idx[np.argsort(-row_scores[top_idx])]
+            data = row.data
+            indices = row.indices
+            if data.max() <= MIN_TFIDF_SCORE:
+                continue
+            k = min(TOP_K, len(data))
+            top_local = np.argpartition(-data, k - 1)[:k]
+            top_local = top_local[np.argsort(-data[top_local])]
             s1_id = s1_df.iloc[start + i]["entity_id"]
-            for idx in top_idx:
-                score = row_scores[idx]
+            for local_idx in top_local:
+                score = data[local_idx]
                 if score <= MIN_TFIDF_SCORE:
                     continue
-                results[s1_id].append((other_ids[idx], float(score)))
+                cand_idx = indices[local_idx]
+                results[s1_id].append((other_ids[cand_idx], float(score)))
     return results
 
 
@@ -138,7 +153,10 @@ def run_blocking(source1_path, source2_path, source3_path, output_path):
         build_combined_text(s3_df),
     ], ignore_index=True)
 
-    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=1)
+    vectorizer = TfidfVectorizer(
+        analyzer="char_wb", ngram_range=(2, 4), min_df=2,
+        max_features=MAX_VOCAB, dtype=np.float32,
+    )
     vectorizer.fit(all_text)
 
     print("Running TF-IDF nearest-neighbor blocking...")
