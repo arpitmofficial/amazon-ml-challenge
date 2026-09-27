@@ -1,0 +1,10 @@
+pandas
+numpy
+scikit-learn
+tqdm
+fuzzywuzzy
+python-Levenshtein
+joblib
+xgboost
+lightgbm
+pyarrow
